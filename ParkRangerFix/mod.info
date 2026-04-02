@@ -1,0 +1,7 @@
+name=Park Ranger Herbalist Fix
+id=ParkRangerFix
+description=Corrige o exploit onde jogadores com a profissao Park Ranger podem remover o traço Herbalist multiplas vezes para ganhar pontos extras na criacao de personagem. Compativel com B42.
+author=Fix Mod
+version=1.0
+modversion=1.0
+url=
