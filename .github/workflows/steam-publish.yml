@@ -1,0 +1,171 @@
+name: Publish to Steam Workshop
+
+on:
+  push:
+    branches:
+      - master
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write  # necessário para atualizar WORKSHOP_ITEM_ID no repo se for primeira publicação
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # ─────────────────────────────────────────────────────────────────
+      # Extrai o corpo da PR mergeada para usar como changelog.
+      # Se o push não veio de uma PR (commit direto), usa a mensagem
+      # do commit como fallback.
+      # ─────────────────────────────────────────────────────────────────
+      - name: Get merged PR description
+        id: pr_info
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const sha = context.sha;
+
+            const { data: prs } = await github.rest.repos.listPullRequestsAssociatedWithCommit({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              commit_sha: sha,
+            });
+
+            const merged = prs.find(pr => pr.merged_at !== null);
+
+            let changelog = '';
+            if (merged && merged.body && merged.body.trim() !== '') {
+              changelog = merged.body.trim();
+              core.info(`Usando corpo da PR #${merged.number} como changelog.`);
+            } else {
+              // Fallback: mensagem do commit
+              const { data: commit } = await github.rest.repos.getCommit({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                ref: sha,
+              });
+              changelog = commit.commit.message.trim();
+              core.info('Nenhuma PR mergeada encontrada. Usando mensagem do commit como changelog.');
+            }
+
+            // Limita a 8000 chars (limite da Steam)
+            if (changelog.length > 8000) {
+              changelog = changelog.substring(0, 7997) + '...';
+            }
+
+            core.setOutput('changelog', changelog);
+
+      # ─────────────────────────────────────────────────────────────────
+      # Instala steamcmd
+      # ─────────────────────────────────────────────────────────────────
+      - name: Install steamcmd
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y lib32gcc-s1
+          mkdir -p "$HOME/steamcmd"
+          curl -sqL "https://steamcdn-a.akamaihd.net/client/installer/steamcmd_linux.tar.gz" \
+            | tar -xzf - -C "$HOME/steamcmd"
+
+      # ─────────────────────────────────────────────────────────────────
+      # Restaura o config.vdf com as credenciais já autenticadas.
+      #
+      # Como gerar o STEAM_CONFIG_VDF:
+      #   1. Faça login UMA VEZ na máquina local com o steamcmd:
+      #      ./steamcmd.sh +login SEU_USUARIO +quit
+      #      (complete o Steam Guard quando pedido)
+      #   2. Encode o arquivo gerado em base64:
+      #      base64 -w0 ~/.steam/steam/config/config.vdf
+      #   3. Cole o resultado como secret STEAM_CONFIG_VDF no GitHub.
+      # ─────────────────────────────────────────────────────────────────
+      - name: Restore Steam config (cached credentials)
+        run: |
+          mkdir -p "$HOME/Steam/config"
+          echo "${{ secrets.STEAM_CONFIG_VDF }}" | base64 -d > "$HOME/Steam/config/config.vdf"
+          chmod 600 "$HOME/Steam/config/config.vdf"
+
+      # ─────────────────────────────────────────────────────────────────
+      # Lê o WORKSHOP_ITEM_ID salvo no arquivo .workshop_item_id
+      # (criado automaticamente na primeira publicação).
+      # Se não existir, usa "0" para criar um novo item na Steam.
+      # ─────────────────────────────────────────────────────────────────
+      - name: Read Workshop Item ID
+        id: workshop_id
+        run: |
+          if [ -f ".workshop_item_id" ]; then
+            ITEM_ID=$(cat .workshop_item_id | tr -d '[:space:]')
+          else
+            ITEM_ID="0"
+          fi
+          echo "item_id=$ITEM_ID" >> "$GITHUB_OUTPUT"
+          echo "Workshop Item ID: $ITEM_ID"
+
+      # ─────────────────────────────────────────────────────────────────
+      # Gera o arquivo VDF que descreve o item da Steam Workshop
+      # ─────────────────────────────────────────────────────────────────
+      - name: Generate workshop VDF
+        env:
+          CHANGELOG: ${{ steps.pr_info.outputs.changelog }}
+          ITEM_ID: ${{ steps.workshop_id.outputs.item_id }}
+        run: |
+          # Escapa aspas duplas para o formato VDF
+          CHANGELOG_ESCAPED="${CHANGELOG//\"/\\\"}"
+
+          cat > /tmp/workshop.vdf <<VDF
+          "workshopitem"
+          {
+              "appid"             "108600"
+              "publishedfileid"   "${ITEM_ID}"
+              "contentfolder"     "${GITHUB_WORKSPACE}/ParkRangerFix"
+              "previewfile"       "${GITHUB_WORKSPACE}/ParkRangerFix/preview.png"
+              "visibility"        "0"
+              "title"             "Park Ranger Herbalist Fix"
+              "description"       "Corrige o exploit onde jogadores com a profissao Park Ranger podem remover o traco Herbalist multiplas vezes para ganhar pontos extras na criacao de personagem. Compativel com B42."
+              "changenote"        "${CHANGELOG_ESCAPED}"
+              "tags"
+              {
+                  "tag"   "Build 42"
+              }
+          }
+          VDF
+
+          echo "--- VDF gerado ---"
+          cat /tmp/workshop.vdf
+
+      # ─────────────────────────────────────────────────────────────────
+      # Publica / atualiza o item na Steam Workshop
+      # ─────────────────────────────────────────────────────────────────
+      - name: Publish to Steam Workshop
+        run: |
+          "$HOME/steamcmd/steamcmd.sh" \
+            +login "${{ secrets.STEAM_USERNAME }}" "${{ secrets.STEAM_PASSWORD }}" \
+            +workshop_build_item /tmp/workshop.vdf \
+            +quit
+
+      # ─────────────────────────────────────────────────────────────────
+      # Na primeira publicação (item_id == "0"), o steamcmd cria um novo
+      # item e imprime o ID no output. Capturamos e salvamos no repo para
+      # usos futuros.
+      # ─────────────────────────────────────────────────────────────────
+      - name: Save Workshop Item ID (first publish only)
+        if: steps.workshop_id.outputs.item_id == '0'
+        run: |
+          # steamcmd imprime algo como:
+          # "Workshop item published/updated successfully XXXXXXXXXXXXXXXXX."
+          # Tenta extrair o ID do log (o steamcmd não tem saída estruturada,
+          # então buscamos pelo padrão numérico de 17 dígitos).
+          NEW_ID=$(grep -oP '(?<=successfully )\d+' /tmp/steamcmd_output.txt 2>/dev/null || true)
+
+          if [ -n "$NEW_ID" ]; then
+            echo "$NEW_ID" > .workshop_item_id
+            git config user.name  "github-actions[bot]"
+            git config user.email "github-actions[bot]@users.noreply.github.com"
+            git add .workshop_item_id
+            git commit -m "chore: salva Workshop Item ID após primeira publicação [skip ci]"
+            git push
+            echo "Novo Workshop Item ID salvo: $NEW_ID"
+          else
+            echo "AVISO: Não foi possível extrair o Workshop Item ID automaticamente."
+            echo "Verifique o log do steamcmd e salve o ID manualmente no arquivo .workshop_item_id"
+          fi
